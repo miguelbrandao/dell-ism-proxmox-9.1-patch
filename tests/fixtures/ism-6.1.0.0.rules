@@ -1,0 +1,6 @@
+# Verbatim from a Dell PowerEdge running iSM 6.1.0.0-4104.ubuntu24 on Proxmox 9.
+# Note: two rule lines with IDENTICAL match keys, one RUN+= each. udev ran them in
+# order in a single worker, so the touch always preceded the daemon start.
+# Dell USBNIC Device
+SUBSYSTEM=="usb", ATTR{idVendor}=="413c", ATTR{idProduct}=="a102", ATTR{manufacturer}=="Dell(TM)", ACTION=="add", RUN+="/bin/touch /opt/dell/srvadmin/iSM/etc/ini/usbnicconfig.ini"
+SUBSYSTEM=="usb", ATTR{idVendor}=="413c", ATTR{idProduct}=="a102", ATTR{manufacturer}=="Dell(TM)", ACTION=="add", RUN+="/etc/init.d/dcismeng start &"

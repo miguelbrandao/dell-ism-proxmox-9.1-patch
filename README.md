@@ -45,10 +45,14 @@ Move the daemon start out of the udev worker and into systemd. Four steps:
    `RUN+=` commands. Everything below is generated from that, not from constants.
    Both `RUN+="…"` and the C-escaped `RUN+=e"…"` form are understood, as is
    `RUN{program}+=`.
-1. **Install a systemd oneshot handler per converted line** —
-   `/etc/systemd/system/dcism-usbnic-hotplug.service` (`-2`, `-3`… if the rule file has
-   more than one `ACTION=="add"` line) runs Dell's own commands, in order, outside the
-   udev worker, so nothing blocks the udev queue. Each becomes `ExecStart=-…`; the `-`
+1. **Install a systemd oneshot handler per matched device** —
+   `/etc/systemd/system/dcism-usbnic-hotplug.service` runs Dell's own commands, in order,
+   outside the udev worker, so nothing blocks the udev queue. Rule lines sharing the same
+   match keys are **merged into one unit**: iSM 6.1.0.0 splits a single device's work
+   across two lines (`touch` on one, `dcismeng start` on the next), and udev ran those
+   sequentially in one worker. Separate units would start in parallel and lose that
+   ordering. A genuinely different device match gets its own unit (`-2`, `-3`…).
+   Each command becomes `ExecStart=-…`; the `-`
    mirrors udev, where every `RUN+=` fires regardless of the previous one's exit status.
    The unit is `RemainAfterExit=yes` — with `no` it would go inactive the moment the
    last command returned, and systemd's default `KillMode=control-group` would take the
@@ -120,7 +124,7 @@ only lasts for the current boot.
 | Proxmox VE | 9.1 / 9.x | fix verified on hardware (upstream) |
 | Debian | 13 (Trixie) | fix verified on hardware (upstream) |
 | dcism | 5.4.2.0-4048.ubuntu24 | rule form covered by tests; fix verified on hardware |
-| dcism | 6.1.0.0-4104.ubuntu24 | derived at runtime from whatever it ships; not yet verified on hardware |
+| dcism | 6.1.0.0-4104.ubuntu24 | real rule file captured as a test fixture and parsed correctly; boot not yet verified on hardware |
 | Hardware | Dell PowerEdge R440 | verified |
 
 Because the rule is parsed at runtime rather than assumed, other iSM versions should
@@ -133,11 +137,13 @@ there so you can check it against your own version first.
 ./tests/run-tests.sh     # no root, no dcism, no systemd required
 ```
 
-35 assertions over fixtures in [tests/fixtures/](tests/fixtures/): the 5.4.2 rule form,
-a variant with different USB IDs and paths plus a line continuation and a `/bin/sh -c`
-command, an `ACTION=="remove"` line placed before the `add` line, two `add` lines, the
-`e"…"` and `RUN{program}+=` forms, and every refusal path (`%`, `$`, relative path,
-already patched, no `RUN+=`, missing file). The apply path is covered too, in a sandbox
+41 assertions over fixtures in [tests/fixtures/](tests/fixtures/): the 5.4.2 rule form,
+the real 6.1.0.0 rule (two lines, same match keys — asserts they merge into one unit
+with the `touch` still ordered before `dcismeng start`), a variant with different USB IDs
+and paths plus a line continuation and a `/bin/sh -c` command, an `ACTION=="remove"` line
+placed before the `add` line, two genuinely different `add` lines, the `e"…"` and
+`RUN{program}+=` forms, and every refusal path (`%`, `$`, relative path, already patched,
+no `RUN+=`, missing file). The apply path is covered too, in a sandbox
 with stubbed `dpkg-divert` / `systemctl` / `udevadm`: unit written, rule rewritten,
 original diverted, stale units cleaned, and a forced `daemon-reload` failure leaving the
 original rule undiverted.

@@ -43,6 +43,12 @@ UNIT_BODIES=()
 RULE_OUT=()
 PLAN_NOTES=()
 
+# One group per distinct set of device match keys; rule lines sharing keys merge
+# into the same group so their commands stay in one ordered unit.
+GROUP_KEYS=()
+GROUP_UNITS=()
+GROUP_EXECS=()
+
 # ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
@@ -234,12 +240,12 @@ ParseDellRule()
             return 1
         fi
 
-        UNIT_EXECS=""
+        LINE_EXECS=""
         CMD_COUNT=0
         while IFS= read -r CMD; do
             [ -z "$CMD" ] && continue
             EXEC_LINE=$(CommandToExecStart "$CMD") || return 1
-            UNIT_EXECS="${UNIT_EXECS}${EXEC_LINE}"$'\n'
+            LINE_EXECS="${LINE_EXECS}${EXEC_LINE}"$'\n'
             CMD_COUNT=$((CMD_COUNT + 1))
         done <<EOF
 $(ExtractRunCommands "$LINE")
@@ -251,6 +257,28 @@ EOF
             return 1
         fi
 
+        # Dell splits one device's commands across several rule lines sharing the
+        # same match keys (iSM 6.1.0.0 does exactly this: touch on one line, daemon
+        # start on the next). udev ran those sequentially in one worker, so their
+        # order was guaranteed. Separate units would start in parallel and lose it —
+        # so lines with identical match keys are merged into a single unit, keeping
+        # the commands in file order.
+        GROUP=-1
+        I=0
+        while [ "$I" -lt "$CONVERTED" ]; do
+            if [ "${GROUP_KEYS[$I]}" = "$MATCH_KEYS" ]; then
+                GROUP=$I
+                break
+            fi
+            I=$((I + 1))
+        done
+
+        if [ "$GROUP" -ge 0 ]; then
+            GROUP_EXECS[$GROUP]="${GROUP_EXECS[$GROUP]}${LINE_EXECS}"
+            PLAN_NOTES[${#PLAN_NOTES[@]}]="merged into ${GROUP_UNITS[$GROUP]} (same match keys, order preserved): $LINE"
+            continue
+        fi
+
         CONVERTED=$((CONVERTED + 1))
         if [ "$CONVERTED" -eq 1 ]; then
             UNIT_NAME="${SERVICE_BASE}.service"
@@ -258,8 +286,9 @@ EOF
             UNIT_NAME="${SERVICE_BASE}-${CONVERTED}.service"
         fi
 
-        UNIT_NAMES[${#UNIT_NAMES[@]}]="$UNIT_NAME"
-        UNIT_BODIES[${#UNIT_BODIES[@]}]="$(RenderUnitBody "$UNIT_EXECS")"
+        GROUP_KEYS[${#GROUP_KEYS[@]}]="$MATCH_KEYS"
+        GROUP_UNITS[${#GROUP_UNITS[@]}]="$UNIT_NAME"
+        GROUP_EXECS[${#GROUP_EXECS[@]}]="$LINE_EXECS"
         RULE_OUT[${#RULE_OUT[@]}]="${MATCH_KEYS}, TAG+=\"systemd\", ENV{SYSTEMD_WANTS}=\"${UNIT_NAME}\""
     done <<EOF
 $RULE_BODY
@@ -277,6 +306,13 @@ EOF
         fi
         return 1
     fi
+
+    I=0
+    while [ "$I" -lt "$CONVERTED" ]; do
+        UNIT_NAMES[${#UNIT_NAMES[@]}]="${GROUP_UNITS[$I]}"
+        UNIT_BODIES[${#UNIT_BODIES[@]}]="$(RenderUnitBody "${GROUP_EXECS[$I]}")"
+        I=$((I + 1))
+    done
 
     return 0
 }

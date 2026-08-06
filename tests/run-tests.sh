@@ -108,6 +108,20 @@ AssertContains  "continuation: second command" continuation-and-shell.rules \
 AssertContains  "continuation: product id a103" continuation-and-shell.rules \
     'ATTR{idProduct}=="a103"'
 
+echo "== 6.1.0.0 rule form (real hardware) =="
+AssertRc        "6.1.0.0: parses"          ism-6.1.0.0.rules 0
+AssertContains  "6.1.0.0: same match keys merge into one unit" ism-6.1.0.0.rules \
+    'Rule lines converted: 1'
+AssertNotContains "6.1.0.0: no second unit" ism-6.1.0.0.rules \
+    'dcism-usbnic-hotplug-2.service'
+AssertContains  "6.1.0.0: touch ordered before daemon start" ism-6.1.0.0.rules \
+    'ExecStart=-/bin/touch /opt/dell/srvadmin/iSM/etc/ini/usbnicconfig.ini
+ExecStart=-/etc/init.d/dcismeng start &'
+AssertContains  "6.1.0.0: merge reported in notes" ism-6.1.0.0.rules \
+    'merged into dcism-usbnic-hotplug.service'
+AssertContains  "6.1.0.0: single handoff rule line" ism-6.1.0.0.rules \
+    'ATTR{manufacturer}=="Dell(TM)", ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}="dcism-usbnic-hotplug.service"'
+
 echo "== multiple rule lines =="
 AssertRc        "add+remove: parses"       add-and-remove.rules 0
 AssertContains  "add+remove: remove line preserved verbatim" add-and-remove.rules \
