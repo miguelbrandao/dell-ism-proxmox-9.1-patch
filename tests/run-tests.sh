@@ -116,9 +116,13 @@ AssertNotContains "6.1.0.0: no second unit" ism-6.1.0.0.rules \
     'dcism-usbnic-hotplug-2.service'
 AssertContains  "6.1.0.0: touch ordered before daemon start" ism-6.1.0.0.rules \
     'ExecStart=-/bin/touch /opt/dell/srvadmin/iSM/etc/ini/usbnicconfig.ini
-ExecStart=-/etc/init.d/dcismeng start &'
+ExecStart=-/etc/init.d/dcismeng start'
 AssertContains  "6.1.0.0: merge reported in notes" ism-6.1.0.0.rules \
     'merged into dcism-usbnic-hotplug.service'
+AssertNotContains "6.1.0.0: trailing & dropped from ExecStart" ism-6.1.0.0.rules \
+    'ExecStart=-/etc/init.d/dcismeng start &'
+AssertContains  "6.1.0.0: dropped & reported in notes" ism-6.1.0.0.rules \
+    "dropped trailing '&'"
 AssertContains  "6.1.0.0: single handoff rule line" ism-6.1.0.0.rules \
     'ATTR{manufacturer}=="Dell(TM)", ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}+="dcism-usbnic-hotplug.service"'
 

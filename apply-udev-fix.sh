@@ -162,6 +162,18 @@ CommandToExecStart()
             ;;
     esac
 
+    # Anything left that looks like shell syntax, in a command that invokes no
+    # shell, is passed through as literal arguments — by udev before, by systemd
+    # now. Same behaviour either way, but say so rather than let it look intended.
+    case "$CMD" in
+        /bin/sh\ *|/bin/bash\ *|/usr/bin/sh\ *|/usr/bin/bash\ *) ;;
+        *['|&;<>']*)
+            echo "WARNING: RUN command contains shell syntax but invokes no shell:" >&2
+            echo "         $CMD" >&2
+            echo "         udev passed it as literal arguments and so will systemd." >&2
+            ;;
+    esac
+
     printf 'ExecStart=-%s\n' "$CMD"
     return 0
 }
@@ -244,6 +256,19 @@ ParseDellRule()
         CMD_COUNT=0
         while IFS= read -r CMD; do
             [ -z "$CMD" ] && continue
+
+            # iSM 6.1.0.0 ships RUN+="/etc/init.d/dcismeng start &". udev runs RUN
+            # without a shell, so that '&' never backgrounded anything — it was
+            # handed to the init script as a literal argument, which ignored it.
+            # systemd would do exactly the same, so keeping it changes nothing
+            # today, but it reads as backgrounding and would break the moment a
+            # command checked its arguments. Dropped, and reported in the plan.
+            STRIPPED=$(printf '%s' "$CMD" | sed 's/[[:space:]]*&[[:space:]]*$//')
+            if [ "$STRIPPED" != "$CMD" ]; then
+                PLAN_NOTES[${#PLAN_NOTES[@]}]="dropped trailing '&' (udev passed it as a literal argument, it never backgrounded): $CMD"
+                CMD="$STRIPPED"
+            fi
+
             EXEC_LINE=$(CommandToExecStart "$CMD") || return 1
             LINE_EXECS="${LINE_EXECS}${EXEC_LINE}"$'\n'
             CMD_COUNT=$((CMD_COUNT + 1))

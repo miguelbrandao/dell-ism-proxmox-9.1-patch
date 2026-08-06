@@ -69,6 +69,13 @@ Everything that can fail happens *before* the diversion, so a failed `daemon-rel
 an unloadable generated unit leaves the host with Dell's working rule still in place
 rather than no rule at all.
 
+A trailing `&` is dropped, and the drop is reported. iSM 6.1.0.0 ships
+`RUN+="/etc/init.d/dcismeng start &"`, but udev runs `RUN+=` without a shell, so that
+`&` never backgrounded anything — it reached the init script as a literal argument,
+which ignored it. systemd behaves identically, so keeping it would change nothing
+today; it is dropped because it reads as backgrounding and would break the first time
+a command checked its arguments.
+
 The script refuses rather than half-applying. A `RUN` command containing `%` or `$` is
 not translatable — systemd re-expands both in `ExecStart`, and udev expands its own
 `%k` / `$env{}` before running — so it stops and tells you to convert that rule by hand
@@ -137,7 +144,7 @@ there so you can check it against your own version first.
 ./tests/run-tests.sh     # no root, no dcism, no systemd required
 ```
 
-41 assertions over fixtures in [tests/fixtures/](tests/fixtures/): the 5.4.2 rule form,
+43 assertions over fixtures in [tests/fixtures/](tests/fixtures/): the 5.4.2 rule form,
 the real 6.1.0.0 rule (two lines, same match keys — asserts they merge into one unit
 with the `touch` still ordered before `dcismeng start`), a variant with different USB IDs
 and paths plus a line continuation and a `/bin/sh -c` command, an `ACTION=="remove"` line
