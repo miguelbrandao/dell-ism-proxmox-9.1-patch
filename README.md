@@ -81,14 +81,25 @@ git clone https://github.com/miguelbrandao/dell-ism-proxmox-9.1-patch.git
 cd dell-ism-proxmox-9.1-patch
 chmod +x apply-udev-fix.sh
 
-sudo ./apply-udev-fix.sh
+sudo ./apply-udev-fix.sh --dry-run    # print the current rule and every change
+sudo ./apply-udev-fix.sh --apply
 reboot
 ```
 
+| Mode | Effect |
+|---|---|
+| *(no arguments)* | print usage and exit — never changes anything |
+| `--dry-run` | print the installed rule and both files that would be written |
+| `--apply` | install the unit, divert Dell's rule, write the replacement |
+| `--revert` | restore Dell's original rule and remove the unit |
+
+`--apply` is explicit on purpose: this rewrites a udev rule the host network depends on
+at boot, so a bare invocation shows usage instead.
+
 Requires root and Debian. Refuses to run if `95-iSM-usbnic.rules` is missing, or if it
 doesn't look like the 6.1.0.0 rule — it prints the file so you can check it yourself.
-Safe to re-run: the diversion is idempotent, and once applied the check reads the
-preserved `.distrib` original.
+Safe to re-run: the diversion is idempotent, and once applied both `--dry-run` and the
+version check read the preserved `.distrib` original.
 
 ### Verify after reboot
 
@@ -105,13 +116,13 @@ systemd-analyze blame | grep udev    # settle no longer takes minutes
 ### Undo
 
 ```bash
-sudo rm /etc/udev/rules.d/95-iSM-usbnic.rules
-sudo dpkg-divert --local --rename --remove /etc/udev/rules.d/95-iSM-usbnic.rules
-sudo rm /etc/systemd/system/dcism-usbnic-hotplug.service
-sudo systemctl daemon-reload && sudo udevadm control --reload-rules
+sudo ./apply-udev-fix.sh --revert
 ```
 
-Restores Dell's original rule — and the boot hang.
+Removes the replacement rule, undoes the diversion so Dell's original comes back from
+`.distrib`, deletes the unit, and reloads systemd and udev. Restores Dell's original
+rule — and the boot hang. Safe to run twice; it says so and stops if there is nothing
+diverted.
 
 ### Locked out already?
 

@@ -37,7 +37,10 @@
 #     anything. systemd would treat it the same way; it is dropped because it
 #     reads as something it isn't.
 #
-# Usage: sudo ./apply-udev-fix.sh
+# Usage:
+#   sudo ./apply-udev-fix.sh --dry-run    print what would change, touch nothing
+#   sudo ./apply-udev-fix.sh --apply      apply the fix
+#   sudo ./apply-udev-fix.sh --revert     restore Dell's rule (boot hang returns)
 ###############################################################################
 
 set -e
@@ -46,10 +49,74 @@ UDEV_RULE="/etc/udev/rules.d/95-iSM-usbnic.rules"
 UNIT="/etc/systemd/system/dcism-usbnic-hotplug.service"
 STALE_UNIT="/etc/systemd/system/dcism-usbnic-hotplug-2.service"
 
+Usage()
+{
+    cat << USAGEEOF
+Dell iSM udev boot fix — Proxmox VE 9 (Debian 13), dcism 6.1.0.0-4104.ubuntu24
+
+Moves the iSM daemon start out of the udev worker into a systemd oneshot, so
+udev-settle stops timing out and networking.service comes up at boot.
+
+Usage: $0 <mode>
+
+  --dry-run   print the current rule and everything that would change, write nothing
+  --apply     apply the fix (reboot afterwards)
+  --revert    restore Dell's original rule — the boot hang comes back
+
+Run as root. --apply is deliberately explicit: this rewrites a udev rule that
+the host network depends on at boot.
+USAGEEOF
+}
+
+case "${1:-}" in
+    --dry-run)  MODE="dry-run" ;;
+    --apply)    MODE="apply" ;;
+    --revert)   MODE="revert" ;;
+    "")         Usage; exit 0 ;;
+    *)          echo "Unknown option: $1"; echo ""; Usage; exit 2 ;;
+esac
+
 [ "$(id -u)" -eq 0 ] || { echo "ERROR: must run as root."; exit 1; }
 [ -f /etc/debian_version ] || { echo "ERROR: not a Debian-based system."; exit 1; }
 
-# Parse source is the diverted original once the fix has been applied before.
+IsDiverted()
+{
+    dpkg-divert --list "$UDEV_RULE" | grep -q "$UDEV_RULE"
+}
+
+# ---------------------------------------------------------------------------
+# Revert: undo in reverse. The replacement rule goes first — dpkg-divert refuses
+# to move the original back over a file already sitting at that path.
+# ---------------------------------------------------------------------------
+if [ "$MODE" = "revert" ]; then
+    if ! IsDiverted; then
+        echo "Nothing to revert: $UDEV_RULE is not diverted."
+        echo "The fix was never applied here, or was already reverted."
+        # A leftover unit with the diversion gone means a half-reverted state;
+        # clean it rather than leaving something that still starts the daemon.
+        if [ -f "$UNIT" ] || [ -f "$STALE_UNIT" ]; then
+            rm -f "$UNIT" "$STALE_UNIT"
+            systemctl daemon-reload
+            echo "Removed a leftover hotplug unit."
+        fi
+        exit 0
+    fi
+
+    rm -f "$UDEV_RULE"
+    dpkg-divert --local --rename --remove "$UDEV_RULE" > /dev/null
+    rm -f "$UNIT" "$STALE_UNIT"
+    systemctl daemon-reload
+    udevadm control --reload-rules
+
+    echo "Reverted."
+    echo "  - Restored: $UDEV_RULE (Dell's original, blocking RUN+=)"
+    echo "  - Removed:  $UNIT"
+    echo ""
+    echo "The boot hang comes back on the next reboot."
+    exit 0
+fi
+
+# Once applied, the diverted copy is the original; check that instead.
 ORIGINAL="$UDEV_RULE"
 [ -f "${UDEV_RULE}.distrib" ] && ORIGINAL="${UDEV_RULE}.distrib"
 
@@ -68,12 +135,15 @@ if ! grep -q 'idProduct}=="a102"' "$ORIGINAL" || ! grep -q 'dcismeng start' "$OR
     exit 1
 fi
 
-echo "Applying dcism udev boot fix..."
+# The two files this installs. Functions so --dry-run can print exactly what
+# --apply would write.
 
-# 1. The oneshot handler. RemainAfterExit=yes matters: with 'no' the unit goes
-#    inactive as soon as the last ExecStart returns, and systemd's default
-#    KillMode=control-group kills the daemon dcismeng just forked into its cgroup.
-cat > "$UNIT" << 'SERVICEEOF'
+# RemainAfterExit=yes matters: with 'no' the unit goes inactive as soon as the
+# last ExecStart returns, and systemd's default KillMode=control-group kills the
+# daemon dcismeng just forked into its cgroup.
+UnitContents()
+{
+    cat << 'SERVICEEOF'
 [Unit]
 Description=Dell iSM USB NIC hotplug handler
 Documentation=https://github.com/miguelbrandao/dell-ism-proxmox-9.1-patch
@@ -85,6 +155,46 @@ RemainAfterExit=yes
 ExecStart=-/bin/touch /opt/dell/srvadmin/iSM/etc/ini/usbnicconfig.ini
 ExecStart=-/etc/init.d/dcismeng start
 SERVICEEOF
+}
+
+RuleContents()
+{
+    cat << 'RULEEOF'
+# Dell USBNIC Device — patched for Debian/Proxmox systemd compatibility.
+# Dell's original used blocking RUN+= which hangs udev-settle on Debian and
+# leaves the host with no network at boot. Its two rule lines are merged here;
+# their commands now live in dcism-usbnic-hotplug.service.
+# Original preserved by dpkg-divert at 95-iSM-usbnic.rules.distrib
+SUBSYSTEM=="usb", ATTR{idVendor}=="413c", ATTR{idProduct}=="a102", ATTR{manufacturer}=="Dell(TM)", ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}+="dcism-usbnic-hotplug.service"
+RULEEOF
+}
+
+if [ "$MODE" = "dry-run" ]; then
+    echo "Dry run — nothing will be changed."
+    echo ""
+    echo "Rule this would replace ($ORIGINAL):"
+    grep -v '^[[:space:]]*#' "$ORIGINAL" | grep -v '^[[:space:]]*$' | sed 's/^/  | /' || true
+    echo ""
+    echo "--- would write $UNIT ---"
+    UnitContents
+    echo "--- would write $UDEV_RULE ---"
+    RuleContents
+    echo ""
+    echo "Would also:"
+    if IsDiverted; then
+        echo "  - leave the existing diversion of $UDEV_RULE in place"
+    else
+        echo "  - dpkg-divert --local --rename --add $UDEV_RULE"
+    fi
+    [ -f "$STALE_UNIT" ] && echo "  - remove $STALE_UNIT (left by an older version of this script)"
+    echo "  - systemctl daemon-reload; udevadm control --reload-rules"
+    exit 0
+fi
+
+echo "Applying dcism udev boot fix..."
+
+# 1. The oneshot handler.
+UnitContents > "$UNIT"
 
 # An earlier version of this script split the two rule lines into two units.
 rm -f "$STALE_UNIT"
@@ -93,19 +203,10 @@ systemctl daemon-reload
 
 # 2. Divert Dell's rule so package upgrades cannot restore the blocking version.
 #    After daemon-reload, so a failure above leaves the working rule in place.
-if ! dpkg-divert --list "$UDEV_RULE" | grep -q "$UDEV_RULE"; then
-    dpkg-divert --local --rename --add "$UDEV_RULE" > /dev/null
-fi
+IsDiverted || dpkg-divert --local --rename --add "$UDEV_RULE" > /dev/null
 
 # 3. Non-blocking replacement: both original lines collapse into this one.
-cat > "$UDEV_RULE" << 'RULEEOF'
-# Dell USBNIC Device — patched for Debian/Proxmox systemd compatibility.
-# Dell's original used blocking RUN+= which hangs udev-settle on Debian and
-# leaves the host with no network at boot. Its two rule lines are merged here;
-# their commands now live in dcism-usbnic-hotplug.service.
-# Original preserved by dpkg-divert at 95-iSM-usbnic.rules.distrib
-SUBSYSTEM=="usb", ATTR{idVendor}=="413c", ATTR{idProduct}=="a102", ATTR{manufacturer}=="Dell(TM)", ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}+="dcism-usbnic-hotplug.service"
-RULEEOF
+RuleContents > "$UDEV_RULE"
 
 udevadm control --reload-rules
 
