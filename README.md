@@ -76,15 +76,23 @@ OS-to-iDRAC pass-through are untouched and keep working.
 
 ## Usage
 
+Single file, no repo needed:
+
 ```bash
-git clone https://github.com/miguelbrandao/dell-ism-proxmox-9.1-patch.git
-cd dell-ism-proxmox-9.1-patch
+wget https://raw.githubusercontent.com/miguelbrandao/dell-ism-proxmox-9.1-patch/refs/heads/master/apply-udev-fix.sh
+# or: curl -fLO https://raw.githubusercontent.com/miguelbrandao/dell-ism-proxmox-9.1-patch/refs/heads/master/apply-udev-fix.sh
+
+less apply-udev-fix.sh                # read it first; it runs as root
 chmod +x apply-udev-fix.sh
 
 sudo ./apply-udev-fix.sh --dry-run    # print the current rule and every change
 sudo ./apply-udev-fix.sh --apply
 reboot
 ```
+
+Download and read it rather than piping into a shell — it rewrites a udev rule the host
+network depends on at boot, and `--dry-run` is there so you can see the exact result
+before committing to it.
 
 | Mode | Effect |
 |---|---|
