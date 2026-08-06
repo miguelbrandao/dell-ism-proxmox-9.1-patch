@@ -1,0 +1,3 @@
+# remove line deliberately first: must not shadow or drop the add line
+SUBSYSTEM=="usb", ATTR{idVendor}=="413c", ATTR{idProduct}=="a102", ACTION=="remove", RUN+="/etc/init.d/dcismeng stop"
+SUBSYSTEM=="usb", ATTR{idVendor}=="413c", ATTR{idProduct}=="a102", ACTION=="add", RUN+="/etc/init.d/dcismeng start"

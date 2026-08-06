@@ -1,0 +1,4 @@
+# hypothetical future layout: different product id, different paths,
+# a /bin/sh -c command, and a line continuation
+SUBSYSTEM=="usb", ATTR{idVendor}=="413c", ATTR{idProduct}=="a103", ATTR{manufacturer}=="Dell(TM)", ACTION=="add", \
+  RUN+="/bin/sh -c 'echo 1 > /opt/dell/srvadmin/iSM/var/usbnic.flag'", RUN+="/usr/sbin/dcism-usbnic --start"

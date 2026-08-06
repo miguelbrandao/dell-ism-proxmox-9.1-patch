@@ -1,0 +1,1 @@
+SUBSYSTEM=="net", ACTION=="add", RUN+="/bin/sh -c 'echo $env{INTERFACE} > /run/x'"

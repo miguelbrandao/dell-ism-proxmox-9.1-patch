@@ -1,0 +1,1 @@
+SUBSYSTEM=="usb", ATTR{idVendor}=="413c", ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}="dcism-usbnic-hotplug.service"

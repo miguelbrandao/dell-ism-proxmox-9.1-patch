@@ -1,0 +1,1 @@
+SUBSYSTEM=="usb", ATTR{idVendor}=="413c", ACTION=="add", ENV{ID_MODEL}="iDRAC"
