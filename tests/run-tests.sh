@@ -92,7 +92,7 @@ $OUT"
 echo "== 5.4.2 rule form =="
 AssertRc        "5.4.2: parses"            ism-5.4.2.rules 0
 AssertContains  "5.4.2: keeps match keys"  ism-5.4.2.rules \
-    'SUBSYSTEM=="usb", ATTR{idVendor}=="413c", ATTR{idProduct}=="a102", ATTR{manufacturer}=="Dell(TM)", ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}="dcism-usbnic-hotplug.service"'
+    'SUBSYSTEM=="usb", ATTR{idVendor}=="413c", ATTR{idProduct}=="a102", ATTR{manufacturer}=="Dell(TM)", ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}+="dcism-usbnic-hotplug.service"'
 AssertContains  "5.4.2: touch command"     ism-5.4.2.rules \
     'ExecStart=-/bin/touch /opt/dell/srvadmin/iSM/etc/ini/usbnicconfig.ini'
 AssertContains  "5.4.2: start command"     ism-5.4.2.rules \
@@ -120,14 +120,14 @@ ExecStart=-/etc/init.d/dcismeng start &'
 AssertContains  "6.1.0.0: merge reported in notes" ism-6.1.0.0.rules \
     'merged into dcism-usbnic-hotplug.service'
 AssertContains  "6.1.0.0: single handoff rule line" ism-6.1.0.0.rules \
-    'ATTR{manufacturer}=="Dell(TM)", ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}="dcism-usbnic-hotplug.service"'
+    'ATTR{manufacturer}=="Dell(TM)", ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}+="dcism-usbnic-hotplug.service"'
 
 echo "== multiple rule lines =="
 AssertRc        "add+remove: parses"       add-and-remove.rules 0
 AssertContains  "add+remove: remove line preserved verbatim" add-and-remove.rules \
     'ACTION=="remove", RUN+="/etc/init.d/dcismeng stop"'
 AssertContains  "add+remove: add line converted" add-and-remove.rules \
-    'ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}="dcism-usbnic-hotplug.service"'
+    'ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}+="dcism-usbnic-hotplug.service"'
 AssertContains  "two adds: second unit gets its own name" two-add-lines.rules \
     'dcism-usbnic-hotplug-2.service'
 AssertContains  "two adds: both commands present" two-add-lines.rules \
@@ -224,7 +224,7 @@ $(cat "$FILE" 2>&1)"
 
 SB=$(RunApply ism-5.4.2.rules)
 AssertFile "apply: unit written"        "$SB/units/dcism-usbnic-hotplug.service" 'ExecStart=-/etc/init.d/dcismeng start'
-AssertFile "apply: rule rewritten"      "$SB/rules/95-iSM-usbnic.rules" 'ENV{SYSTEMD_WANTS}="dcism-usbnic-hotplug.service"'
+AssertFile "apply: rule rewritten"      "$SB/rules/95-iSM-usbnic.rules" 'ENV{SYSTEMD_WANTS}+="dcism-usbnic-hotplug.service"'
 AssertFile "apply: original diverted"   "$SB/rules/95-iSM-usbnic.rules.distrib" 'RUN+="/etc/init.d/dcismeng start"'
 AssertFile "apply: reports success"     "$SB/apply.log" 'RC=0'
 rm -rf "$SB"

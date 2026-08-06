@@ -289,7 +289,10 @@ EOF
         GROUP_KEYS[${#GROUP_KEYS[@]}]="$MATCH_KEYS"
         GROUP_UNITS[${#GROUP_UNITS[@]}]="$UNIT_NAME"
         GROUP_EXECS[${#GROUP_EXECS[@]}]="$LINE_EXECS"
-        RULE_OUT[${#RULE_OUT[@]}]="${MATCH_KEYS}, TAG+=\"systemd\", ENV{SYSTEMD_WANTS}=\"${UNIT_NAME}\""
+        # += not =. SYSTEMD_WANTS is a list, and '=' assigns: when two rule lines
+        # both match a device, an assignment on the second silently discards the
+        # unit wanted by the first, which then never runs.
+        RULE_OUT[${#RULE_OUT[@]}]="${MATCH_KEYS}, TAG+=\"systemd\", ENV{SYSTEMD_WANTS}+=\"${UNIT_NAME}\""
     done <<EOF
 $RULE_BODY
 EOF
@@ -327,6 +330,45 @@ RenderRuleFile()
 # Original preserved by dpkg-divert at ${DIVERTED_RULE_FILE}
 RULEEOF
     printf '%s\n' ${RULE_OUT[@]+"${RULE_OUT[@]}"}
+}
+
+# ---------------------------------------------------------------------------
+# Dell's rule starts the daemon through /etc/init.d/<name>, while the package
+# also ships an enabled <name>.service. The init script's daemon lands in this
+# unit's cgroup and systemd's does not see it, so both start one and two
+# dsm_ism_srvmgrd processes end up contending. Only a warning: which one should
+# own the daemon is the operator's call, not this script's.
+# ---------------------------------------------------------------------------
+WarnDuplicateDaemon()
+{
+    command -v systemctl > /dev/null 2>&1 || return 0
+
+    I=0
+    while [ "$I" -lt "${#UNIT_BODIES[@]}" ]; do
+        while IFS= read -r EXEC; do
+            case "$EXEC" in
+                ExecStart=-/etc/init.d/*)
+                    SVC=$(printf '%s\n' "$EXEC" | sed -e 's|^ExecStart=-/etc/init.d/||' -e 's/[[:space:]].*$//')
+                    [ -z "$SVC" ] && continue
+                    if [ "$(systemctl is-enabled "${SVC}.service" 2>/dev/null)" = "enabled" ]; then
+                        echo "WARNING: ${SVC}.service is enabled and these commands also start ${SVC}"
+                        echo "         via its init script. Both will start a daemon at boot, in separate"
+                        echo "         cgroups, neither aware of the other. Check after rebooting:"
+                        echo "           systemctl status ${SVC}.service ${UNIT_NAMES[$I]}"
+                        echo "           pgrep -a dsm_ism_srvmgrd"
+                        echo "         If two are running, disable one owner:"
+                        echo "           systemctl disable ${SVC}.service     # udev handoff owns it"
+                        echo ""
+                        return 0
+                    fi
+                    ;;
+            esac
+        done <<EOF
+$(printf '%s\n' "${UNIT_BODIES[$I]}" | grep '^ExecStart=')
+EOF
+        I=$((I + 1))
+    done
+    return 0
 }
 
 ShowPlan()
@@ -469,5 +511,6 @@ ParseDellRule  || exit 1
 ReportEnvironment
 ShowPlan
 echo ""
+WarnDuplicateDaemon
 ApplyDebianUdevFix
 exit $?
