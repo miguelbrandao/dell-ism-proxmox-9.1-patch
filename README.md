@@ -153,17 +153,20 @@ lasts for the current boot.
 
 ## Notes
 
-- **Duplicate daemon.** `dcismeng.service` ships enabled and starts the daemon, while
-  Dell's udev rule starts it again through `/etc/init.d/dcismeng`. The init script's
-  `dsm_ism_srvmgrd` lands in the hotplug unit's cgroup where `dcismeng.service` can't
-  see it, so both start one and the two contend for the OS-to-iDRAC pass-through
-  channel — the loser logs `ISM0006`. Check with `pgrep -a dsm_ism_srvmgrd`; expect
-  one. This predates the fix and is Dell's, not the script's. Pick an owner if it
-  bothers you.
-- Where to get iSM: Dell's support site /
-  `https://linux.dell.com/repo/community/openmanage/iSM/`. On Debian 13 use the
-  **ubuntu24** build and `dpkg -i` it directly — Dell's `setup.sh` does not recognise
-  Debian 13.
+- **Where to get iSM.** Dell's drivers page for your server model, under
+  *Systems Management* — look for **"Dell iDRAC Service Module for Linux, v6.1.0.0"**
+  (`OM-iSM-Dell-Web-LX-6100-4104.tar.gz`). The page is per-model; for a PowerEdge R650
+  it is
+  [dell.com/support/product-details/en-us/product/poweredge-r650/drivers](https://www.dell.com/support/product-details/en-us/product/poweredge-r650/drivers)
+  — swap in your own model. Also mirrored at
+  `https://linux.dell.com/repo/community/openmanage/iSM/`.
+
+  Dell's CDN rejects the default `wget`/`curl` User-Agent, so pass a browser one
+  (`--user-agent "Mozilla/5.0 ..."`) if the download 403s. The tarball ships a `.sign`
+  file — verify it against Dell's PGRE key `1285491434D8786F` before installing.
+
+  On Debian 13 use the **ubuntu24** build and `dpkg -i` it directly (OS Collector
+  `dcism-osc-*` first, then `dcism-*`) — Dell's `setup.sh` does not recognise Debian 13.
 - If your node has **no ZFS pools**, removing `zfsutils-linux` also breaks the
   `systemd-udev-settle` dependency chain and works around the hang. Do **not** do this
   if any storage is on ZFS.

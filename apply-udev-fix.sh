@@ -220,10 +220,4 @@ Reboot, then verify:
   systemctl is-system-running    # running, not degraded
   ip -br a                       # vmbr0 UP with its address
   systemctl status dcismeng      # active (running)
-
-Note: dcismeng.service is enabled and starts the daemon too, so both it and this
-unit start one at boot, in separate cgroups, neither aware of the other. Two
-dsm_ism_srvmgrd processes then contend for the OS-to-iDRAC pass-through channel
-and the loser logs ISM0006. Check with:
-  pgrep -a dsm_ism_srvmgrd       # expect one
 EOF
