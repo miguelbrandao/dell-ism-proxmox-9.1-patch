@@ -1,1 +1,0 @@
-SUBSYSTEM=="usb", ATTR{idVendor}=="413c", ACTION=="add", RUN{program}+="/etc/init.d/dcismeng start"

@@ -1,2 +1,0 @@
-SUBSYSTEM=="usb", ATTR{idVendor}=="413c", ATTR{idProduct}=="a102", ACTION=="add", RUN+="/etc/init.d/dcismeng start"
-SUBSYSTEM=="usb", ATTR{idVendor}=="413c", ATTR{idProduct}=="a103", ACTION=="add", RUN+="/usr/sbin/dcism-usbnic --start"

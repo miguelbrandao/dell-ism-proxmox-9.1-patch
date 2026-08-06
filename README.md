@@ -1,16 +1,11 @@
 # Dell iSM udev Boot Fix — Proxmox VE 9 / Debian 13
 
-A single standalone script that fixes the boot hang caused by Dell's iDRAC Service
-Module (`dcism`) on Debian-based systems. No Dell installer included — apply this
-**after** installing iSM by whatever means you prefer.
+Fixes the boot hang caused by Dell's iDRAC Service Module (`dcism`) on Proxmox VE 9.
+No Dell installer included — apply this **after** installing iSM.
 
-**Version-agnostic.** Nothing about the device IDs or file paths is hardcoded. The
-script reads the rule your installed `dcism` package actually shipped, reuses its
-device match keys verbatim, and converts its `RUN+=` commands into `ExecStart=`
-lines. So it adapts to whatever 5.4.x, 6.1.x or later ships, instead of assuming
-one version's `413c:a102` and `usbnicconfig.ini` paths.
-
-It prints everything it derived from your install before writing anything.
+Targets **dcism 6.1.0.0-4104.ubuntu24** specifically. The rule contents are hardcoded;
+the script checks the installed rule still matches before touching anything and stops
+if it doesn't. For other versions, read [The Fix](#the-fix) and adapt.
 
 ---
 
@@ -38,48 +33,41 @@ directives to start the iSM daemon when the iDRAC USB NIC (`413c:a102`) appears:
 
 ## The Fix
 
-Move the daemon start out of the udev worker and into systemd. Four steps:
+What 6.1.0.0 ships:
 
-0. **Read Dell's own rule** — parse `95-iSM-usbnic.rules` (joining line continuations,
-   skipping comments), splitting each rule line into its device match keys and its
-   `RUN+=` commands. Everything below is generated from that, not from constants.
-   Both `RUN+="…"` and the C-escaped `RUN+=e"…"` form are understood, as is
-   `RUN{program}+=`.
-1. **Install a systemd oneshot handler per matched device** —
-   `/etc/systemd/system/dcism-usbnic-hotplug.service` runs Dell's own commands, in order,
-   outside the udev worker, so nothing blocks the udev queue. Rule lines sharing the same
-   match keys are **merged into one unit**: iSM 6.1.0.0 splits a single device's work
-   across two lines (`touch` on one, `dcismeng start` on the next), and udev ran those
-   sequentially in one worker. Separate units would start in parallel and lose that
-   ordering. A genuinely different device match gets its own unit (`-2`, `-3`…).
-   Each command becomes `ExecStart=-…`; the `-`
-   mirrors udev, where every `RUN+=` fires regardless of the previous one's exit status.
-   The unit is `RemainAfterExit=yes` — with `no` it would go inactive the moment the
-   last command returned, and systemd's default `KillMode=control-group` would take the
-   daemon it just forked down with it.
+```
+# Dell USBNIC Device
+SUBSYSTEM=="usb", ATTR{idVendor}=="413c", ATTR{idProduct}=="a102", ATTR{manufacturer}=="Dell(TM)", ACTION=="add", RUN+="/bin/touch /opt/dell/srvadmin/iSM/etc/ini/usbnicconfig.ini"
+SUBSYSTEM=="usb", ATTR{idVendor}=="413c", ATTR{idProduct}=="a102", ATTR{manufacturer}=="Dell(TM)", ACTION=="add", RUN+="/etc/init.d/dcismeng start &"
+```
+
+Both commands move into one systemd oneshot, and the rule becomes a non-blocking
+handoff to it:
+
+1. **Install `/etc/systemd/system/dcism-usbnic-hotplug.service`** — runs the `touch`
+   then `dcismeng start`, outside the udev worker, so nothing blocks the udev queue.
 2. **Divert the original rule** — `dpkg-divert --local --rename` preserves Dell's file
-   as `95-iSM-usbnic.rules.distrib` and stops future `dcism` upgrades from restoring it.
-   The diverted copy stays the parse source on later runs.
-3. **Write the replacement rule** — converted lines keep their match keys and get
-   `TAG+="systemd"` + `ENV{SYSTEMD_WANTS}`, handing off asynchronously. Every other line
-   of Dell's file, including non-`add` lines such as `ACTION=="remove"` cleanup, is
-   copied through verbatim — those never run at boot, so they are not the problem.
+   as `95-iSM-usbnic.rules.distrib` and stops `dcism` upgrades from restoring it.
+3. **Write the replacement rule** — same match keys, plus `TAG+="systemd"` and
+   `ENV{SYSTEMD_WANTS}+=`, handing off asynchronously.
 
-Everything that can fail happens *before* the diversion, so a failed `daemon-reload` or
-an unloadable generated unit leaves the host with Dell's working rule still in place
-rather than no rule at all.
+### Four details that each cost a boot to learn
 
-A trailing `&` is dropped, and the drop is reported. iSM 6.1.0.0 ships
-`RUN+="/etc/init.d/dcismeng start &"`, but udev runs `RUN+=` without a shell, so that
-`&` never backgrounded anything — it reached the init script as a literal argument,
-which ignored it. systemd behaves identically, so keeping it would change nothing
-today; it is dropped because it reads as backgrounding and would break the first time
-a command checked its arguments.
+- **One unit, not two.** Dell splits the work across two rule lines with identical
+  match keys. udev ran them sequentially in a single worker, so the `touch` always
+  preceded the daemon start. A unit per line would start in parallel and lose that.
+- **`ENV{SYSTEMD_WANTS}+=`, not `=`.** `=` assigns. With one rule line per unit, the
+  second line's assignment discarded the first line's unit and it never ran.
+- **`RemainAfterExit=yes`.** With `no`, the unit goes inactive once the last
+  `ExecStart` returns, and systemd's default `KillMode=control-group` kills the daemon
+  `dcismeng` just forked into its cgroup.
+- **No trailing `&`.** udev runs `RUN+=` without a shell, so Dell's `&` reached the
+  init script as a literal argument and was ignored — it never backgrounded anything.
+  systemd treats it the same way. Dropped because it reads as something it isn't.
 
-The script refuses rather than half-applying. A `RUN` command containing `%` or `$` is
-not translatable — systemd re-expands both in `ExecStart`, and udev expands its own
-`%k` / `$env{}` before running — so it stops and tells you to convert that rule by hand
-instead of installing something subtly broken.
+Ordering inside the script matters too: the unit is written and `daemon-reload` runs
+*before* the diversion, so a failure leaves Dell's working rule in place rather than no
+rule at all.
 
 The iSM daemon (`dsm_ism_srvmgrd`), all iSM features, the `dcismeng` init script, and
 OS-to-iDRAC pass-through are untouched and keep working.
@@ -97,15 +85,10 @@ sudo ./apply-udev-fix.sh
 reboot
 ```
 
-Refuses to run unless: root, `/etc/debian_version` exists, and Dell's
-`95-iSM-usbnic.rules` is present with a parseable `RUN+=` rule. Safe to re-run —
-idempotent. It prints the derived match keys, the commands, and both generated files
-before writing anything, so you can confirm they match your iSM version before
-rebooting.
-
-To undo by hand: `rm` the rule, `dpkg-divert --local --rename --remove` it to restore
-Dell's original, delete `dcism-usbnic-hotplug.service`, then `systemctl daemon-reload`
-and `udevadm control --reload-rules`. The boot hang comes back.
+Requires root and Debian. Refuses to run if `95-iSM-usbnic.rules` is missing, or if it
+doesn't look like the 6.1.0.0 rule — it prints the file so you can check it yourself.
+Safe to re-run: the diversion is idempotent, and once applied the check reads the
+preserved `.distrib` original.
 
 ### Verify after reboot
 
@@ -116,52 +99,52 @@ systemctl status dcismeng            # active (running)
 systemd-analyze blame | grep udev    # settle no longer takes minutes
 ```
 
+`dcism-usbnic-hotplug.service` should read `active (exited)` — a oneshot that finished.
+`inactive (dead)` with a dead daemon would be the cgroup-kill failure mode.
+
+### Undo
+
+```bash
+sudo rm /etc/udev/rules.d/95-iSM-usbnic.rules
+sudo dpkg-divert --local --rename --remove /etc/udev/rules.d/95-iSM-usbnic.rules
+sudo rm /etc/systemd/system/dcism-usbnic-hotplug.service
+sudo systemctl daemon-reload && sudo udevadm control --reload-rules
+```
+
+Restores Dell's original rule — and the boot hang.
+
 ### Locked out already?
 
 Get a console via the iDRAC Virtual Console (independent of host network), then
-`ifreload -a` to bring `vmbr0` back up, apply the fix, and reboot. Manual bring-up
-only lasts for the current boot.
+`ifreload -a` to bring `vmbr0` back up, apply the fix, and reboot. Manual bring-up only
+lasts for the current boot.
 
 ---
 
 ## Tested On
 
-| Component | Version | Status |
-|---|---|---|
-| Proxmox VE | 9.1 / 9.x | fix verified on hardware (upstream) |
-| Debian | 13 (Trixie) | fix verified on hardware (upstream) |
-| dcism | 5.4.2.0-4048.ubuntu24 | rule form covered by tests; fix verified on hardware |
-| dcism | 6.1.0.0-4104.ubuntu24 | real rule file captured as a test fixture and parsed correctly; boot not yet verified on hardware |
-| Hardware | Dell PowerEdge R440 | verified |
-
-Because the rule is parsed at runtime rather than assumed, other iSM versions should
-work — but "should" is not "verified". The plan the script prints before writing is
-there so you can check it against your own version first.
-
-### Tests
-
-```bash
-./tests/run-tests.sh     # no root, no dcism, no systemd required
-```
-
-43 assertions over fixtures in [tests/fixtures/](tests/fixtures/): the 5.4.2 rule form,
-the real 6.1.0.0 rule (two lines, same match keys — asserts they merge into one unit
-with the `touch` still ordered before `dcismeng start`), a variant with different USB IDs
-and paths plus a line continuation and a `/bin/sh -c` command, an `ACTION=="remove"` line
-placed before the `add` line, two genuinely different `add` lines, the `e"…"` and
-`RUN{program}+=` forms, and every refusal path (`%`, `$`, relative path, already patched,
-no `RUN+=`, missing file). The apply path is covered too, in a sandbox
-with stubbed `dpkg-divert` / `systemctl` / `udevadm`: unit written, rule rewritten,
-original diverted, stale units cleaned, and a forced `daemon-reload` failure leaving the
-original rule undiverted.
+| Component | Version |
+|---|---|
+| Proxmox VE | 9.x |
+| Debian | 13 (Trixie) |
+| dcism | 6.1.0.0-4104.ubuntu24 |
+| Hardware | Dell PowerEdge with iDRAC |
 
 ---
 
 ## Notes
 
-- Where to get iSM: Dell's support site / `https://linux.dell.com/repo/community/openmanage/iSM/`.
-  On Debian 13 use the **ubuntu24** build and `dpkg -i` it directly — Dell's `setup.sh`
-  does not recognise Debian 13.
+- **Duplicate daemon.** `dcismeng.service` ships enabled and starts the daemon, while
+  Dell's udev rule starts it again through `/etc/init.d/dcismeng`. The init script's
+  `dsm_ism_srvmgrd` lands in the hotplug unit's cgroup where `dcismeng.service` can't
+  see it, so both start one and the two contend for the OS-to-iDRAC pass-through
+  channel — the loser logs `ISM0006`. Check with `pgrep -a dsm_ism_srvmgrd`; expect
+  one. This predates the fix and is Dell's, not the script's. Pick an owner if it
+  bothers you.
+- Where to get iSM: Dell's support site /
+  `https://linux.dell.com/repo/community/openmanage/iSM/`. On Debian 13 use the
+  **ubuntu24** build and `dpkg -i` it directly — Dell's `setup.sh` does not recognise
+  Debian 13.
 - If your node has **no ZFS pools**, removing `zfsutils-linux` also breaks the
   `systemd-udev-settle` dependency chain and works around the hang. Do **not** do this
   if any storage is on ZFS.
@@ -170,16 +153,6 @@ original rule undiverted.
   # Optional, only when ZFS is definitely unused on this node
   apt remove --purge zfsutils-linux zfs-zed
   ```
-
----
-
-## Files
-
-| File | Description |
-|---|---|
-| `apply-udev-fix.sh` | The fix. Parses Dell's rule, generates the units, applies. |
-| `tests/run-tests.sh` | Parser and apply-path tests. |
-| `tests/fixtures/` | Rule files the tests parse. |
 
 ---
 

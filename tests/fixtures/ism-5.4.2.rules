@@ -1,2 +1,0 @@
-# Dell USBNIC Device
-SUBSYSTEM=="usb", ATTR{idVendor}=="413c", ATTR{idProduct}=="a102", ATTR{manufacturer}=="Dell(TM)", ACTION=="add", RUN+="/bin/touch /opt/dell/srvadmin/iSM/etc/ini/usbnicconfig.ini", RUN+="/etc/init.d/dcismeng start"

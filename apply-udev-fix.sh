@@ -1,541 +1,128 @@
 #!/bin/bash
 ###############################################################################
-# Dell iSM (dcism) udev boot fix for Debian / Proxmox VE
+# Dell iSM udev boot fix — Proxmox VE 9 (Debian 13), dcism 6.1.0.0-4104.ubuntu24
 #
 # Problem:
-#   The dcism package (built for Ubuntu) ships /etc/udev/rules.d/95-iSM-usbnic.rules
-#   which uses blocking RUN+= directives to start the iSM daemon from a udev worker
-#   when the iDRAC USB NIC is detected. On Debian 13 / Proxmox 9 this blocks the udev
-#   worker for 60+ seconds, causing systemd-udev-settle to time out, which delays
-#   networking.service and leaves all interfaces down at boot (no vmbr0, no GUI/SSH).
+#   dcism ships /etc/udev/rules.d/95-iSM-usbnic.rules, which starts the iSM
+#   daemon with blocking RUN+= directives from a udev worker when the iDRAC USB
+#   NIC appears. On Debian 13 that worker stalls 60+ seconds, systemd-udev-settle
+#   (pulled in by zfs-import-cache.service) times out after ~180s,
+#   networking.service fails its dependency, and vmbr0 is never created — no
+#   host network, no web GUI, no SSH.
 #
 # Fix:
-#   1. Read the rule the INSTALLED dcism package shipped and extract, per rule line,
-#      its device match keys and its RUN+= commands. Nothing about the device IDs or
-#      file paths is hardcoded, so this works across iSM versions (5.4.x, 6.1.x, ...).
-#   2. Install one systemd oneshot service per converted rule line, running the same
-#      commands outside the udev worker context.
-#   3. dpkg-divert the rules file so dcism upgrades cannot restore the broken rule,
-#      then write a replacement that hands off via SYSTEMD_WANTS. Rule lines that are
-#      not ACTION=="add" are copied through untouched — they never run at boot.
+#   Move the two commands out of the udev worker into a systemd oneshot, and
+#   replace the rule with a non-blocking handoff to it.
 #
-# The script refuses to convert anything it cannot translate faithfully, rather than
-# reporting success over a half-applied fix.
+# The rule this targets, verbatim from a 6.1.0.0-4104 install:
 #
-# No network access, no package installs. Touches only the paths below.
+#   # Dell USBNIC Device
+#   SUBSYSTEM=="usb", ATTR{idVendor}=="413c", ATTR{idProduct}=="a102", \
+#     ATTR{manufacturer}=="Dell(TM)", ACTION=="add", \
+#     RUN+="/bin/touch /opt/dell/srvadmin/iSM/etc/ini/usbnicconfig.ini"
+#   SUBSYSTEM=="usb", ATTR{idVendor}=="413c", ATTR{idProduct}=="a102", \
+#     ATTR{manufacturer}=="Dell(TM)", ACTION=="add", \
+#     RUN+="/etc/init.d/dcismeng start &"
 #
-# Usage:
-#   sudo ./apply-udev-fix.sh
+#   Two lines, same match keys, one command each. Three things follow from that,
+#   each of which cost a boot to learn:
+#
+#   - One unit, not two. udev ran both lines sequentially in a single worker, so
+#     the touch always preceded the daemon start. Two units would start in
+#     parallel and lose that ordering.
+#   - ENV{SYSTEMD_WANTS}+= , not '='. '=' assigns: with a rule line each, the
+#     second line's assignment discarded the first line's unit and it never ran.
+#   - No trailing '&'. udev runs RUN+= without a shell, so the '&' was passed to
+#     the init script as a literal argument and ignored — it never backgrounded
+#     anything. systemd would treat it the same way; it is dropped because it
+#     reads as something it isn't.
+#
+# Usage: sudo ./apply-udev-fix.sh
 ###############################################################################
 
-set -u
+set -e
 
-# Overridable for testing; defaults are the real system paths.
-UDEV_RULE_FILE="${UDEV_RULE_FILE:-/etc/udev/rules.d/95-iSM-usbnic.rules}"
-DIVERTED_RULE_FILE="${UDEV_RULE_FILE}.distrib"
-SERVICE_DIR="${SERVICE_DIR:-/etc/systemd/system}"
-SERVICE_BASE="dcism-usbnic-hotplug"
-DOC_URL="https://github.com/miguelbrandao/dell-ism-proxmox-9.1-patch"
+UDEV_RULE="/etc/udev/rules.d/95-iSM-usbnic.rules"
+UNIT="/etc/systemd/system/dcism-usbnic-hotplug.service"
+STALE_UNIT="/etc/systemd/system/dcism-usbnic-hotplug-2.service"
 
-SOURCE_RULE=""
-UNIT_NAMES=()
-UNIT_BODIES=()
-RULE_OUT=()
-PLAN_NOTES=()
+[ "$(id -u)" -eq 0 ] || { echo "ERROR: must run as root."; exit 1; }
+[ -f /etc/debian_version ] || { echo "ERROR: not a Debian-based system."; exit 1; }
 
-# One group per distinct set of device match keys; rule lines sharing keys merge
-# into the same group so their commands stay in one ordered unit.
-GROUP_KEYS=()
-GROUP_UNITS=()
-GROUP_EXECS=()
+# Parse source is the diverted original once the fix has been applied before.
+ORIGINAL="$UDEV_RULE"
+[ -f "${UDEV_RULE}.distrib" ] && ORIGINAL="${UDEV_RULE}.distrib"
 
-# ---------------------------------------------------------------------------
-# Preflight
-# ---------------------------------------------------------------------------
-PreflightChecks()
-{
-    if [ "$(id -u)" -ne 0 ]; then
-        echo "ERROR: must run as root."
-        return 1
-    fi
-
-    if [ ! -f /etc/debian_version ]; then
-        echo "ERROR: not a Debian-based system; this fix is not needed here."
-        return 1
-    fi
-
-    for TOOL in dpkg-divert systemctl udevadm; do
-        if ! command -v "$TOOL" > /dev/null 2>&1; then
-            echo "ERROR: required tool not found: $TOOL"
-            return 1
-        fi
-    done
-
-    return 0
+[ -f "$ORIGINAL" ] || {
+    echo "ERROR: $UDEV_RULE not found — install the dcism package first."
+    exit 1
 }
 
-ReportEnvironment()
-{
-    echo "Detected environment:"
-    echo "  OS:      $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Debian $(cat /etc/debian_version 2>/dev/null)}")"
-    if command -v dpkg-query > /dev/null 2>&1; then
-        DCISM_VER=$(dpkg-query -W -f='${Version}' dcism 2>/dev/null)
-        echo "  dcism:   ${DCISM_VER:-not installed via dpkg}"
-    fi
-    echo "  rule:    $SOURCE_RULE"
-    echo ""
-}
+# This script hardcodes one version's rule, so check the installed one still
+# looks like it before overwriting anything.
+if ! grep -q 'idProduct}=="a102"' "$ORIGINAL" || ! grep -q 'dcismeng start' "$ORIGINAL"; then
+    echo "ERROR: $ORIGINAL is not the rule this script was written for."
+    echo "       Expected iSM 6.1.0.0-4104 (413c:a102, /etc/init.d/dcismeng start)."
+    echo "       Review it by hand:"
+    sed 's/^/         | /' "$ORIGINAL"
+    exit 1
+fi
 
-# ---------------------------------------------------------------------------
-# Extract the commands from every RUN+= assignment on one rule line, one per
-# output line.
-#
-# Follows udev's own quoting rules: a plain "..." value ends at the next double
-# quote with no escape processing, while an e"..." value is C-escaped, so \" and
-# \\ are unescaped here. Both RUN+= and RUN{program}+= are recognised.
-# ---------------------------------------------------------------------------
-ExtractRunCommands()
-{
-    printf '%s\n' "$1" | awk '
-    {
-        line = $0
-        while (match(line, /RUN(\{[^}]*\})?[ \t]*\+=[ \t]*e?"/)) {
-            head = substr(line, RSTART, RLENGTH)
-            escaped = (substr(head, length(head) - 1, 1) == "e")
-            line = substr(line, RSTART + RLENGTH)
+echo "Applying dcism udev boot fix..."
 
-            cmd = ""
-            i = 1
-            n = length(line)
-            while (i <= n) {
-                c = substr(line, i, 1)
-                if (escaped && c == "\\" && i < n) {
-                    nc = substr(line, i + 1, 1)
-                    if (nc == "\"" || nc == "\\") { cmd = cmd nc; i += 2; continue }
-                }
-                if (c == "\"") break
-                cmd = cmd c
-                i++
-            }
-            print cmd
-            line = substr(line, i + 1)
-        }
-    }'
-}
-
-# ---------------------------------------------------------------------------
-# Turn one RUN command into an ExecStart= line, or fail.
-#
-# The '-' prefix mirrors udev, where every RUN+= fires regardless of the
-# previous one's exit status.
-#
-# Refusals matter here: systemd expands % specifiers and $VAR in ExecStart, and
-# udev expands its own %k / $env{} substitutions before running RUN. Neither can
-# be reproduced by the other, so a command using either is not translatable and
-# the script stops instead of installing something subtly wrong.
-# ---------------------------------------------------------------------------
-CommandToExecStart()
-{
-    CMD="$1"
-
-    case "$CMD" in
-        /*) ;;
-        *)
-            echo "ERROR: RUN command is not an absolute path, cannot convert:" >&2
-            echo "       $CMD" >&2
-            return 1
-            ;;
-    esac
-
-    case "$CMD" in
-        *%*)
-            echo "ERROR: RUN command contains '%' (udev or systemd specifier):" >&2
-            echo "       $CMD" >&2
-            echo "       systemd would re-expand it in ExecStart. Convert this rule by hand." >&2
-            return 1
-            ;;
-        *\$*)
-            echo "ERROR: RUN command contains '\$' (udev substitution or shell variable):" >&2
-            echo "       $CMD" >&2
-            echo "       systemd would re-expand it in ExecStart. Convert this rule by hand." >&2
-            return 1
-            ;;
-    esac
-
-    # Anything left that looks like shell syntax, in a command that invokes no
-    # shell, is passed through as literal arguments — by udev before, by systemd
-    # now. Same behaviour either way, but say so rather than let it look intended.
-    case "$CMD" in
-        /bin/sh\ *|/bin/bash\ *|/usr/bin/sh\ *|/usr/bin/bash\ *) ;;
-        *['|&;<>']*)
-            echo "WARNING: RUN command contains shell syntax but invokes no shell:" >&2
-            echo "         $CMD" >&2
-            echo "         udev passed it as literal arguments and so will systemd." >&2
-            ;;
-    esac
-
-    printf 'ExecStart=-%s\n' "$CMD"
-    return 0
-}
-
-RenderUnitBody()
-{
-    UNIT_EXECS="$1"
-    cat << SERVICEEOF
+# 1. The oneshot handler. RemainAfterExit=yes matters: with 'no' the unit goes
+#    inactive as soon as the last ExecStart returns, and systemd's default
+#    KillMode=control-group kills the daemon dcismeng just forked into its cgroup.
+cat > "$UNIT" << 'SERVICEEOF'
 [Unit]
 Description=Dell iSM USB NIC hotplug handler
-Documentation=${DOC_URL}
+Documentation=https://github.com/miguelbrandao/dell-ism-proxmox-9.1-patch
 After=systemd-udevd.service
 
 [Service]
 Type=oneshot
-# The daemon these commands fork lives in this unit's cgroup. With
-# RemainAfterExit=no the unit would go inactive as soon as the last ExecStart
-# returned, and systemd's default KillMode=control-group would take the daemon
-# down with it.
 RemainAfterExit=yes
-${UNIT_EXECS}
+ExecStart=-/bin/touch /opt/dell/srvadmin/iSM/etc/ini/usbnicconfig.ini
+ExecStart=-/etc/init.d/dcismeng start
 SERVICEEOF
-}
 
-# ---------------------------------------------------------------------------
-# Parse the installed Dell rule into the units and rule lines to write.
-#
-# Source is the diverted original when the fix was applied before, otherwise the
-# live rule. Every line is accounted for: ACTION=="add" lines carrying RUN+= are
-# converted, everything else is passed through verbatim so nothing is dropped.
-# ---------------------------------------------------------------------------
-ParseDellRule()
-{
-    if [ -f "$DIVERTED_RULE_FILE" ]; then
-        SOURCE_RULE="$DIVERTED_RULE_FILE"
-    elif [ -f "$UDEV_RULE_FILE" ]; then
-        SOURCE_RULE="$UDEV_RULE_FILE"
-    else
-        echo "ERROR: $UDEV_RULE_FILE not found."
-        echo "       Install the dcism package first, or this iSM version does not ship"
-        echo "       the USB NIC udev rule (in which case the fix is not needed)."
-        return 1
-    fi
+# An earlier version of this script split the two rule lines into two units.
+rm -f "$STALE_UNIT"
 
-    # Join backslash continuations, drop comments and blank lines.
-    RULE_BODY=$(sed -e :a -e '/\\$/N; s/\\[[:space:]]*\n[[:space:]]*//; ta' "$SOURCE_RULE" \
-                | grep -v '^[[:space:]]*#' | grep -v '^[[:space:]]*$')
+systemctl daemon-reload
 
-    if [ -z "$RULE_BODY" ]; then
-        echo "ERROR: $SOURCE_RULE contains no rules."
-        return 1
-    fi
-
-    CONVERTED=0
-    while IFS= read -r LINE; do
-        [ -z "$LINE" ] && continue
-
-        if ! printf '%s\n' "$LINE" | grep -q 'RUN[^=]*+='; then
-            RULE_OUT[${#RULE_OUT[@]}]="$LINE"
-            continue
-        fi
-
-        # Only add-time rules run at boot, and SYSTEMD_WANTS is only honoured for
-        # add/change. Anything else keeps Dell's original behaviour.
-        if ! printf '%s\n' "$LINE" | grep -q 'ACTION=="add"'; then
-            RULE_OUT[${#RULE_OUT[@]}]="$LINE"
-            PLAN_NOTES[${#PLAN_NOTES[@]}]="left unchanged (not ACTION==\"add\", never runs at boot): $LINE"
-            continue
-        fi
-
-        MATCH_KEYS=$(printf '%s\n' "$LINE" \
-                     | sed -e 's/[[:space:]]*RUN[^=]*+=.*$//' -e 's/[[:space:]]*,[[:space:]]*$//')
-        if [ -z "$MATCH_KEYS" ]; then
-            echo "ERROR: could not extract device match keys from:"
-            echo "       $LINE"
-            return 1
-        fi
-
-        LINE_EXECS=""
-        CMD_COUNT=0
-        while IFS= read -r CMD; do
-            [ -z "$CMD" ] && continue
-
-            # iSM 6.1.0.0 ships RUN+="/etc/init.d/dcismeng start &". udev runs RUN
-            # without a shell, so that '&' never backgrounded anything — it was
-            # handed to the init script as a literal argument, which ignored it.
-            # systemd would do exactly the same, so keeping it changes nothing
-            # today, but it reads as backgrounding and would break the moment a
-            # command checked its arguments. Dropped, and reported in the plan.
-            STRIPPED=$(printf '%s' "$CMD" | sed 's/[[:space:]]*&[[:space:]]*$//')
-            if [ "$STRIPPED" != "$CMD" ]; then
-                PLAN_NOTES[${#PLAN_NOTES[@]}]="dropped trailing '&' (udev passed it as a literal argument, it never backgrounded): $CMD"
-                CMD="$STRIPPED"
-            fi
-
-            EXEC_LINE=$(CommandToExecStart "$CMD") || return 1
-            LINE_EXECS="${LINE_EXECS}${EXEC_LINE}"$'\n'
-            CMD_COUNT=$((CMD_COUNT + 1))
-        done <<EOF
-$(ExtractRunCommands "$LINE")
-EOF
-
-        if [ "$CMD_COUNT" -eq 0 ]; then
-            echo "ERROR: found RUN+= but could not extract any command from:"
-            echo "       $LINE"
-            return 1
-        fi
-
-        # Dell splits one device's commands across several rule lines sharing the
-        # same match keys (iSM 6.1.0.0 does exactly this: touch on one line, daemon
-        # start on the next). udev ran those sequentially in one worker, so their
-        # order was guaranteed. Separate units would start in parallel and lose it —
-        # so lines with identical match keys are merged into a single unit, keeping
-        # the commands in file order.
-        GROUP=-1
-        I=0
-        while [ "$I" -lt "$CONVERTED" ]; do
-            if [ "${GROUP_KEYS[$I]}" = "$MATCH_KEYS" ]; then
-                GROUP=$I
-                break
-            fi
-            I=$((I + 1))
-        done
-
-        if [ "$GROUP" -ge 0 ]; then
-            GROUP_EXECS[$GROUP]="${GROUP_EXECS[$GROUP]}${LINE_EXECS}"
-            PLAN_NOTES[${#PLAN_NOTES[@]}]="merged into ${GROUP_UNITS[$GROUP]} (same match keys, order preserved): $LINE"
-            continue
-        fi
-
-        CONVERTED=$((CONVERTED + 1))
-        if [ "$CONVERTED" -eq 1 ]; then
-            UNIT_NAME="${SERVICE_BASE}.service"
-        else
-            UNIT_NAME="${SERVICE_BASE}-${CONVERTED}.service"
-        fi
-
-        GROUP_KEYS[${#GROUP_KEYS[@]}]="$MATCH_KEYS"
-        GROUP_UNITS[${#GROUP_UNITS[@]}]="$UNIT_NAME"
-        GROUP_EXECS[${#GROUP_EXECS[@]}]="$LINE_EXECS"
-        # += not =. SYSTEMD_WANTS is a list, and '=' assigns: when two rule lines
-        # both match a device, an assignment on the second silently discards the
-        # unit wanted by the first, which then never runs.
-        RULE_OUT[${#RULE_OUT[@]}]="${MATCH_KEYS}, TAG+=\"systemd\", ENV{SYSTEMD_WANTS}+=\"${UNIT_NAME}\""
-    done <<EOF
-$RULE_BODY
-EOF
-
-    if [ "$CONVERTED" -eq 0 ]; then
-        if printf '%s\n' "$RULE_BODY" | grep -q "SYSTEMD_WANTS"; then
-            echo "ERROR: $SOURCE_RULE already hands off to systemd and carries no"
-            echo "       original RUN+= rule to derive commands from."
-            echo "       The fix appears to be applied already; nothing to do."
-        else
-            echo "ERROR: no ACTION==\"add\" rule with RUN+= found in $SOURCE_RULE —"
-            echo "       nothing that could hang the boot. Contents:"
-            printf '%s\n' "$RULE_BODY" | sed 's/^/       | /'
-        fi
-        return 1
-    fi
-
-    I=0
-    while [ "$I" -lt "$CONVERTED" ]; do
-        UNIT_NAMES[${#UNIT_NAMES[@]}]="${GROUP_UNITS[$I]}"
-        UNIT_BODIES[${#UNIT_BODIES[@]}]="$(RenderUnitBody "${GROUP_EXECS[$I]}")"
-        I=$((I + 1))
-    done
-
-    return 0
-}
-
-RenderRuleFile()
-{
-    cat << RULEEOF
-# Dell USBNIC Device — patched for Debian/Proxmox systemd compatibility.
-# Dell's original rule used blocking RUN+= which hangs udev-settle on Debian and
-# leaves the host with no network at boot. Match keys below are copied verbatim
-# from that rule; its RUN+= commands now live in ${SERVICE_BASE}*.service.
-# Original preserved by dpkg-divert at ${DIVERTED_RULE_FILE}
-RULEEOF
-    printf '%s\n' ${RULE_OUT[@]+"${RULE_OUT[@]}"}
-}
-
-# ---------------------------------------------------------------------------
-# Dell's rule starts the daemon through /etc/init.d/<name>, while the package
-# also ships an enabled <name>.service. The init script's daemon lands in this
-# unit's cgroup and systemd's does not see it, so both start one and two
-# dsm_ism_srvmgrd processes end up contending. Only a warning: which one should
-# own the daemon is the operator's call, not this script's.
-# ---------------------------------------------------------------------------
-WarnDuplicateDaemon()
-{
-    command -v systemctl > /dev/null 2>&1 || return 0
-
-    I=0
-    while [ "$I" -lt "${#UNIT_BODIES[@]}" ]; do
-        while IFS= read -r EXEC; do
-            case "$EXEC" in
-                ExecStart=-/etc/init.d/*)
-                    SVC=$(printf '%s\n' "$EXEC" | sed -e 's|^ExecStart=-/etc/init.d/||' -e 's/[[:space:]].*$//')
-                    [ -z "$SVC" ] && continue
-                    if [ "$(systemctl is-enabled "${SVC}.service" 2>/dev/null)" = "enabled" ]; then
-                        echo "WARNING: ${SVC}.service is enabled and these commands also start ${SVC}"
-                        echo "         via its init script. Both will start a daemon at boot, in separate"
-                        echo "         cgroups, neither aware of the other. Check after rebooting:"
-                        echo "           systemctl status ${SVC}.service ${UNIT_NAMES[$I]}"
-                        echo "           pgrep -a dsm_ism_srvmgrd"
-                        echo "         If two are running, disable one owner:"
-                        echo "           systemctl disable ${SVC}.service     # udev handoff owns it"
-                        echo ""
-                        return 0
-                    fi
-                    ;;
-            esac
-        done <<EOF
-$(printf '%s\n' "${UNIT_BODIES[$I]}" | grep '^ExecStart=')
-EOF
-        I=$((I + 1))
-    done
-    return 0
-}
-
-ShowPlan()
-{
-    echo "Rule lines converted: ${#UNIT_NAMES[@]}"
-    echo ""
-    I=0
-    while [ "$I" -lt "${#UNIT_NAMES[@]}" ]; do
-        echo "--- ${SERVICE_DIR}/${UNIT_NAMES[$I]} ---"
-        printf '%s\n' "${UNIT_BODIES[$I]}"
-        I=$((I + 1))
-    done
-    echo "--- $UDEV_RULE_FILE ---"
-    RenderRuleFile
-    if [ "${#PLAN_NOTES[@]}" -gt 0 ]; then
-        echo ""
-        echo "Notes:"
-        printf '  - %s\n' ${PLAN_NOTES[@]+"${PLAN_NOTES[@]}"}
-    fi
-}
-
-# ---------------------------------------------------------------------------
-# Apply
-#
-# Order matters: everything that can still fail happens before the diversion.
-# Once the original rule is diverted away, a later failure would leave the host
-# with no working rule at all.
-# ---------------------------------------------------------------------------
-VerifyUnits()
-{
-    command -v systemd-analyze > /dev/null 2>&1 || return 0
-
-    STAGE_DIR=$(mktemp -d) || return 0
-    I=0
-    while [ "$I" -lt "${#UNIT_NAMES[@]}" ]; do
-        printf '%s\n' "${UNIT_BODIES[$I]}" > "${STAGE_DIR}/${UNIT_NAMES[$I]}"
-        I=$((I + 1))
-    done
-
-    VERIFY_OUT=$(systemd-analyze verify "${STAGE_DIR}"/*.service 2>&1)
-    VERIFY_RC=$?
-    rm -rf "$STAGE_DIR"
-
-    if [ "$VERIFY_RC" -ne 0 ]; then
-        echo "ERROR: generated unit failed systemd-analyze verify:"
-        printf '%s\n' "$VERIFY_OUT" | sed 's/^/       /'
-        return 1
-    fi
-    return 0
-}
-
-RemoveStaleUnits()
-{
-    for EXISTING in "${SERVICE_DIR}/${SERVICE_BASE}"*.service; do
-        [ -f "$EXISTING" ] || continue
-        KEEP=0
-        for NAME in ${UNIT_NAMES[@]+"${UNIT_NAMES[@]}"}; do
-            [ "$(basename "$EXISTING")" = "$NAME" ] && KEEP=1
-        done
-        if [ "$KEEP" -eq 0 ]; then
-            echo "  - Removing stale unit: $EXISTING"
-            systemctl disable "$(basename "$EXISTING")" > /dev/null 2>&1
-            rm -f "$EXISTING"
-        fi
-    done
-}
-
-ApplyDebianUdevFix()
-{
-    echo "Applying dcism udev boot fix..."
-
-    VerifyUnits || return 1
-
-    # Step 1: install the oneshot handlers carrying Dell's own commands
-    I=0
-    while [ "$I" -lt "${#UNIT_NAMES[@]}" ]; do
-        if ! printf '%s\n' "${UNIT_BODIES[$I]}" > "${SERVICE_DIR}/${UNIT_NAMES[$I]}"; then
-            echo "ERROR: failed to create ${SERVICE_DIR}/${UNIT_NAMES[$I]}"
-            return 1
-        fi
-        I=$((I + 1))
-    done
-    RemoveStaleUnits
-
-    if ! RELOAD_OUT=$(systemctl daemon-reload 2>&1); then
-        echo "ERROR: systemctl daemon-reload failed:"
-        printf '%s\n' "$RELOAD_OUT" | sed 's/^/       /'
-        echo "       Original udev rule left in place; nothing was diverted."
-        return 1
-    fi
-
-    # Step 2: divert so dcism upgrades cannot restore the blocking rule
-    if ! dpkg-divert --list "$UDEV_RULE_FILE" | grep -q "$UDEV_RULE_FILE"; then
-        if ! DIVERT_OUT=$(dpkg-divert --local --rename --add "$UDEV_RULE_FILE" 2>&1); then
-            echo "ERROR: dpkg-divert failed for $UDEV_RULE_FILE:"
-            printf '%s\n' "$DIVERT_OUT" | sed 's/^/       /'
-            return 1
-        fi
-    fi
-
-    # Step 3: replacement rule
-    if ! RenderRuleFile > "$UDEV_RULE_FILE"; then
-        echo "ERROR: failed to write fixed udev rule to $UDEV_RULE_FILE"
-        return 1
-    fi
-
-    if ! UDEV_OUT=$(udevadm control --reload-rules 2>&1); then
-        echo "WARNING: 'udevadm control --reload-rules' failed:"
-        printf '%s\n' "$UDEV_OUT" | sed 's/^/         /'
-        echo "         The new rule is on disk and takes effect at next boot anyway."
-    fi
-
-    echo "udev boot fix applied successfully."
-    I=0
-    while [ "$I" -lt "${#UNIT_NAMES[@]}" ]; do
-        echo "  - Installed: ${SERVICE_DIR}/${UNIT_NAMES[$I]}"
-        I=$((I + 1))
-    done
-    echo "  - Diverted:  $DIVERTED_RULE_FILE (original preserved)"
-    echo "  - Replaced:  $UDEV_RULE_FILE (non-blocking systemd handoff)"
-    echo ""
-    echo "Reboot to verify. Expected afterwards:"
-    echo "  systemctl is-system-running   -> running (not degraded)"
-    echo "  ip -br a                      -> vmbr0 UP with its address"
-    echo "  systemctl status dcismeng     -> active (running)"
-    return 0
-}
-
-# ---------------------------------------------------------------------------
-# Sourced by tests/run-tests.sh to exercise the parser directly.
-[ "${ISM_FIX_SOURCE_ONLY:-0}" = "1" ] && return 0
-
-if [ $# -ne 0 ]; then
-    echo "Usage: $0"
-    exit 2
+# 2. Divert Dell's rule so package upgrades cannot restore the blocking version.
+#    After daemon-reload, so a failure above leaves the working rule in place.
+if ! dpkg-divert --list "$UDEV_RULE" | grep -q "$UDEV_RULE"; then
+    dpkg-divert --local --rename --add "$UDEV_RULE" > /dev/null
 fi
 
-PreflightChecks || exit 1
-ParseDellRule  || exit 1
-ReportEnvironment
-ShowPlan
-echo ""
-WarnDuplicateDaemon
-ApplyDebianUdevFix
-exit $?
+# 3. Non-blocking replacement: both original lines collapse into this one.
+cat > "$UDEV_RULE" << 'RULEEOF'
+# Dell USBNIC Device — patched for Debian/Proxmox systemd compatibility.
+# Dell's original used blocking RUN+= which hangs udev-settle on Debian and
+# leaves the host with no network at boot. Its two rule lines are merged here;
+# their commands now live in dcism-usbnic-hotplug.service.
+# Original preserved by dpkg-divert at 95-iSM-usbnic.rules.distrib
+SUBSYSTEM=="usb", ATTR{idVendor}=="413c", ATTR{idProduct}=="a102", ATTR{manufacturer}=="Dell(TM)", ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}+="dcism-usbnic-hotplug.service"
+RULEEOF
+
+udevadm control --reload-rules
+
+cat << EOF
+Fix applied.
+  - Installed: $UNIT
+  - Diverted:  ${UDEV_RULE}.distrib (original preserved)
+  - Replaced:  $UDEV_RULE (non-blocking systemd handoff)
+
+Reboot, then verify:
+  systemctl is-system-running    # running, not degraded
+  ip -br a                       # vmbr0 UP with its address
+  systemctl status dcismeng      # active (running)
+
+Note: dcismeng.service is enabled and starts the daemon too, so both it and this
+unit start one at boot, in separate cgroups, neither aware of the other. Two
+dsm_ism_srvmgrd processes then contend for the OS-to-iDRAC pass-through channel
+and the loser logs ISM0006. Check with:
+  pgrep -a dsm_ism_srvmgrd       # expect one
+EOF

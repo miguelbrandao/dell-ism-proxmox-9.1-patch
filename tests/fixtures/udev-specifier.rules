@@ -1,1 +1,0 @@
-SUBSYSTEM=="net", ACTION=="add", RUN+="/sbin/ifup %k"
