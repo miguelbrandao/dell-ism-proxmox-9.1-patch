@@ -24,18 +24,9 @@
 #     ATTR{manufacturer}=="Dell(TM)", ACTION=="add", \
 #     RUN+="/etc/init.d/dcismeng start &"
 #
-#   Two lines, same match keys, one command each. Three things follow from that,
-#   each of which cost a boot to learn:
-#
-#   - One unit, not two. udev ran both lines sequentially in a single worker, so
-#     the touch always preceded the daemon start. Two units would start in
-#     parallel and lose that ordering.
-#   - ENV{SYSTEMD_WANTS}+= , not '='. '=' assigns: with a rule line each, the
-#     second line's assignment discarded the first line's unit and it never ran.
-#   - No trailing '&'. udev runs RUN+= without a shell, so the '&' was passed to
-#     the init script as a literal argument and ignored — it never backgrounded
-#     anything. systemd would treat it the same way; it is dropped because it
-#     reads as something it isn't.
+#   Two lines, same match keys, one command each — so both commands go into one
+#   unit, in order. The trailing '&' is dropped: udev runs RUN+= without a shell,
+#   so it was a literal argument the init script ignored, never backgrounding.
 #
 # Usage:
 #   sudo ./apply-udev-fix.sh --dry-run    print what would change, touch nothing
@@ -138,9 +129,11 @@ fi
 # The two files this installs. Functions so --dry-run can print exactly what
 # --apply would write.
 
-# RemainAfterExit=yes matters: with 'no' the unit goes inactive as soon as the
-# last ExecStart returns, and systemd's default KillMode=control-group kills the
-# daemon dcismeng just forked into its cgroup.
+# dcismeng forks dsm_ism_srvmgrd into this unit's cgroup. With RemainAfterExit=no
+# the unit goes inactive as soon as the last ExecStart returns, and systemd's
+# default KillMode=control-group should then take the daemon with it. The cgroup
+# placement is confirmed; the kill is documented behaviour rather than something
+# tested here — 'yes' is the cautious setting.
 UnitContents()
 {
     cat << 'SERVICEEOF'

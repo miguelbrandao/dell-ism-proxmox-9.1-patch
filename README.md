@@ -51,26 +51,16 @@ handoff to it:
 3. **Write the replacement rule** — same match keys, plus `TAG+="systemd"` and
    `ENV{SYSTEMD_WANTS}+=`, handing off asynchronously.
 
-### Four details that each cost a boot to learn
+Two things about the generated unit are easy to "correct" back into bugs: Dell's two
+rule lines share match keys and must stay in **one** unit, or the `touch` and the daemon
+start race; and the trailing `&` in Dell's `RUN+=` was never backgrounding anything —
+udev runs `RUN+=` without a shell, so it arrived as a literal argument the init script
+ignored. `ENV{SYSTEMD_WANTS}+=` and `RemainAfterExit=yes` are the cautious choices for
+the same reasons.
 
-- **One unit, not two.** Dell splits the work across two rule lines with identical
-  match keys. udev ran them sequentially in a single worker, so the `touch` always
-  preceded the daemon start. A unit per line would start in parallel and lose that.
-- **`ENV{SYSTEMD_WANTS}+=`, not `=`.** `=` assigns. With one rule line per unit, the
-  second line's assignment discarded the first line's unit and it never ran.
-- **`RemainAfterExit=yes`.** With `no`, the unit goes inactive once the last
-  `ExecStart` returns, and systemd's default `KillMode=control-group` kills the daemon
-  `dcismeng` just forked into its cgroup.
-- **No trailing `&`.** udev runs `RUN+=` without a shell, so Dell's `&` reached the
-  init script as a literal argument and was ignored — it never backgrounded anything.
-  systemd treats it the same way. Dropped because it reads as something it isn't.
-
-Ordering inside the script matters too: the unit is written and `daemon-reload` runs
-*before* the diversion, so a failure leaves Dell's working rule in place rather than no
-rule at all.
-
-The iSM daemon (`dsm_ism_srvmgrd`), all iSM features, the `dcismeng` init script, and
-OS-to-iDRAC pass-through are untouched and keep working.
+Only the udev rule changes. The iSM daemon, all iSM features, the `dcismeng` init script
+and `dcismeng.service` files, and OS-to-iDRAC pass-through are left alone — the daemon
+simply gets started from a systemd unit instead of from inside a udev worker.
 
 ---
 
@@ -89,6 +79,16 @@ sudo ./apply-udev-fix.sh --dry-run    # print the current rule and every change
 sudo ./apply-udev-fix.sh --apply
 reboot
 ```
+
+No need to reboot just to get iSM running — the fix is about what happens at *boot*.
+To start the daemon now:
+
+```bash
+sudo systemctl start dcismeng
+```
+
+Start, not `enable`: the udev rule starts it on every subsequent boot, and enabling the
+service as well would give you two daemons.
 
 Download and read it rather than piping into a shell — it rewrites a udev rule the host
 network depends on at boot, and `--dry-run` is there so you can see the exact result
@@ -144,7 +144,7 @@ lasts for the current boot.
 
 | Component | Version |
 |---|---|
-| Proxmox VE | 9.x |
+| Proxmox VE | 9.1.7 |
 | Debian | 13 (Trixie) |
 | dcism | 6.1.0.0-4104.ubuntu24 |
 | Hardware | Dell PowerEdge with iDRAC |
